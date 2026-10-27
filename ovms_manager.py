@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QC
                                QScrollArea)
 
 APP_ID = "ovms-manager"  # = name of the .desktop file created by install.sh
-APP_VERSION = "1.0.0"    # compared with the latest GitHub release for update notifications
+APP_VERSION = "1.1.0"    # compared with the latest GitHub release for update notifications
 APP_REPO = "VarCode-ai/ovms-manager"  # GitHub repository whose releases are checked for updates
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if not os.path.exists(os.path.join(APP_DIR, "ui_kit.py")):  # running from the repository: the kit is in ./common

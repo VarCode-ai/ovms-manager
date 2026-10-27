@@ -9,6 +9,8 @@ repository, then named `ai-app-local-openvino`, together with Lectern; its histo
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-10-27
+
 ### Monad
 
 - OVMS Manager has its own repository, as one of the apps of [Monad](https://github.com/VarCode-ai/monad).
@@ -19,7 +21,10 @@ repository, then named `ai-app-local-openvino`, together with Lectern; its histo
 
 - AppImage: one file with Python, Qt and OpenVINO inside, for any x86-64 distribution with glibc 2.34 or
   newer. It does not include the Converter: use the installer with `--with-optimum` for it.
-- A *Release binaries* workflow builds it for every tag and attaches it to the GitHub release.
+- Archive for the installer: `OVMS-Manager-<version>.tar.gz` unpacks into a folder ready for `./install.sh`,
+  for those who prefer an installed app without cloning the repository.
+- A *Release* workflow builds both for every tag and publishes them in the GitHub release, with
+  `SHA256SUMS` and the notes of the version from this changelog.
 
 ### Privacy
 
@@ -40,5 +45,6 @@ First public release.
 - English and Italian interface, per-user installer for every major glibc distribution, automatic fallback
   from GPU or NPU to the CPU, and update notifications that can be turned off.
 
-[Unreleased]: https://github.com/VarCode-ai/ovms-manager/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/VarCode-ai/ovms-manager/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/VarCode-ai/ovms-manager/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/VarCode-ai/ovms-manager/releases/tag/v1.0.0

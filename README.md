@@ -81,6 +81,18 @@ x86-64 distribution with glibc 2.34 or newer. To verify it, compare it with `SHA
 release. To add it to the application menu, use [Gear Lever](https://flathub.org/apps/it.mijorus.gearlever)
 or [AppImageLauncher](https://github.com/TheAssassin/AppImageLauncher), or install from source.
 
+### Download the archive and install it
+
+From the same release, download `OVMS-Manager-<version>.tar.gz`, then:
+
+```bash
+tar -xzf OVMS-Manager-*.tar.gz
+cd ovms-manager-*/
+./install.sh
+```
+
+The installer works as described below. Once the app is installed you can delete the folder.
+
 ### Install from source
 
 ```bash
