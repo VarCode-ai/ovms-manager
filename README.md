@@ -1,28 +1,100 @@
-# OVMS Manager
+<p align="center">
+  <a href="https://github.com/VarCode-ai/monad">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/monad-logo-white.svg">
+      <img alt="Monad" src="docs/brand/monad-logo.svg" width="150">
+    </picture>
+  </a>
+</p>
 
-![OVMS Manager exploring the OpenVINO models on Hugging Face](../docs/images/ovms-manager-explore-dark.png)
+<p align="center"><img src="ovms-manager.svg" alt="" width="96"></p>
 
-A desktop front end for [OpenVINO Model Server](https://github.com/openvinotoolkit/model_server) (OVMS).
-It finds models on Hugging Face, downloads them, and serves them through an OpenAI-compatible API on
-your Intel CPU, GPU or NPU. Any OpenAI-compatible client can then use the model, for example
-[Open WebUI](https://github.com/open-webui/open-webui).
+<h1 align="center">OVMS Manager</h1>
+
+<p align="center">
+  <b>Find, download and serve OpenVINO models on your own machine, from one window.</b>
+</p>
+
+<p align="center">
+  A desktop front end for <a href="https://github.com/openvinotoolkit/model_server">OpenVINO Model Server</a>:
+  browse the OpenVINO models on Hugging Face, download them, and serve them through an
+  OpenAI-compatible API on your Intel CPU, GPU or NPU, for example to chat in Open WebUI.<br>
+  <i>A <a href="https://github.com/VarCode-ai/monad">Monad</a> app.</i>
+</p>
+
+<p align="center">
+  <a href="https://github.com/VarCode-ai/ovms-manager/actions/workflows/checks.yml"><img alt="Checks" src="https://github.com/VarCode-ai/ovms-manager/actions/workflows/checks.yml/badge.svg"></a>
+  <a href="https://github.com/VarCode-ai/ovms-manager/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/VarCode-ai/ovms-manager?style=flat-square&color=2552e0"></a>
+  <a href="LICENSE"><img alt="License: GPL-3.0-or-later" src="https://img.shields.io/badge/license-GPL--3.0--or--later-2552e0?style=flat-square"></a>
+  <img alt="Runs on Intel CPU, GPU and NPU" src="https://img.shields.io/badge/runs%20on-CPU%20%C2%B7%20GPU%20%C2%B7%20NPU-2552e0?style=flat-square">
+  <a href="https://github.com/VarCode-ai/monad"><img alt="A Monad app" src="https://img.shields.io/badge/%E2%8A%99%20a%20Monad%20app-1c1b19?style=flat-square"></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/VarCode-ai/monad"><b>Monad</b></a> ·
+  <a href="https://github.com/VarCode-ai/monad#install-in-this-order">Install guide</a> ·
+  <a href="https://github.com/VarCode-ai/lectern">Lectern</a> ·
+  <a href="https://github.com/VarCode-ai/monad#the-apps">All Monad apps</a>
+</p>
+
+<br>
+
+<p align="center">
+  <img src="docs/images/ovms-manager-explore-dark.png" alt="OVMS Manager: OpenVINO models on Hugging Face, with the RAM fit indicator" width="100%">
+</p>
+
+> [!NOTE]
+> **OVMS Manager is part of [Monad](https://github.com/VarCode-ai/monad)**, a family of desktop apps that run AI models locally
+> with Intel OpenVINO: no cloud, no accounts, no telemetry. It is the **first app to install**: it
+> downloads the models into `~/models`, the folder every Monad app shares, and serves them to other apps.
+> The [install guide](https://github.com/VarCode-ai/monad#install-in-this-order) covers the system packages and what comes next.
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#the-four-pages">The four pages</a> ·
+  <a href="#connect-open-webui">Open WebUI</a> ·
+  <a href="#container-runtime">Container runtime</a> ·
+  <a href="#privacy">Privacy</a> ·
+  <a href="#troubleshooting">Troubleshooting</a>
+</p>
 
 OVMS runs in a container (Podman or Docker), so you don't have to install it or the GPU drivers on your
 system.
 
 ## Install
 
+### Download the AppImage
+
+From the [latest release](https://github.com/VarCode-ai/ovms-manager/releases/latest), download
+`OVMS-Manager-<version>-x86_64.AppImage`, then:
+
 ```bash
-./install.sh                  # the app (PySide6 + requests, about 200 MB)
-./install.sh --with-optimum   # also the Optimum converter (adds a few GB)
+chmod +x OVMS-Manager-*-x86_64.AppImage
+./OVMS-Manager-*-x86_64.AppImage
+```
+
+To also install the Converter (optimum-intel and a CPU-only PyTorch, a few GB), use
+`./install.sh --with-optimum`. The AppImage does not include the Converter.
+
+The AppImage carries its own Python, Qt and OpenVINO: it installs nothing, needs no root and runs on any
+x86-64 distribution with glibc 2.34 or newer. To verify it, compare it with `SHA256SUMS` from the same
+release. To add it to the application menu, use [Gear Lever](https://flathub.org/apps/it.mijorus.gearlever)
+or [AppImageLauncher](https://github.com/TheAssassin/AppImageLauncher), or install from source.
+
+### Install from source
+
+```bash
+git clone https://github.com/VarCode-ai/ovms-manager.git
+cd ovms-manager
+./install.sh
 ```
 
 The installer copies the app to `~/.local/share/ovms-manager/app`, creates a Python environment next to
 it, adds **OVMS Manager** to the application menu and the `ovms-manager` command to `~/.local/bin`.
 Run `./install.sh --help` for every option, and `./install.sh --uninstall` to remove it.
 
-Requirements: Python 3.10+, and Podman or Docker. See the [main README](../README.md#requirements) for
-the packages of each distribution.
+Requirements: Python 3.10+, and Podman or Docker. See [System packages](https://github.com/VarCode-ai/monad#system-packages-by-distribution)
+in the Monad README for the packages of each distribution.
 
 The interface is in English or Italian and follows your system language. To change it, use the 🌐 menu at
 the bottom of the sidebar, then restart the app.
@@ -151,11 +223,41 @@ you download a model or start the server.
 
 | Problem | Fix |
 | --- | --- |
-| The status pill shows *Podman/Docker missing* | Install Podman or Docker (see the main README). |
+| The status pill shows *Podman/Docker missing* | Install Podman or Docker (see [System packages](https://github.com/VarCode-ai/monad#system-packages-by-distribution)). |
 | The status pill shows *Docker error* | Your user cannot use Docker. Add it to the `docker` group (`sudo usermod -aG docker $USER`, then log out and back in) or use Podman. |
 | The container stops right away | Press **Container log**. Common causes: not enough memory for the model, or a device the model doesn't support (try the CPU mode). |
 | GPU mode fails with rootless Podman (`Context was not initialized`, permission denied on `/dev/dri`) | On some distributions the GPU is only accessible through your `render`/`video` group, which rootless containers drop by default. Start OVMS Manager with `OVMS_EXTRA_RUN_ARGS="--group-add keep-groups" ovms-manager` (requires the `crun` runtime, the default on recent distributions). |
 | *Model did not become available* | Large models can take more than 10 minutes on the first load. Check the log, then press **Start server** again: later loads are faster. |
 | Converter: *optimum-cli not found* | Run `./install.sh --with-optimum` and restart the app. |
 
-More fixes are in [docs/troubleshooting.md](../docs/troubleshooting.md).
+More fixes are in [docs/troubleshooting.md](docs/troubleshooting.md), and the problems common to every
+Monad app in the [Monad troubleshooting guide](https://github.com/VarCode-ai/monad/blob/HEAD/docs/troubleshooting.md).
+
+## Privacy
+
+The models answer from your own machine: prompts and answers never leave it. OVMS Manager connects to the
+internet only when you open *Explore Hugging Face* (the catalog is cached for 6 hours), download or convert
+a model, pull the OpenVINO Model Server image once, and to check at most once a day for a new release,
+which you can turn off from the command palette. The full list of connections, for every Monad app, is in
+[Private by design](https://github.com/VarCode-ai/monad#private-by-design).
+
+The OVMS API has **no authentication**: on untrusted networks, enable **Localhost only** on the Server page.
+
+## Contributing
+
+Bug reports, translations and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+Copyright © 2026 VarCode-ai. OVMS Manager is free software, released under the
+[GNU General Public License v3.0 or later](LICENSE). Third-party components keep their own license:
+OpenVINO and OpenVINO Model Server (Apache 2.0), Qt for Python / PySide6 (LGPL v3), the Inter and
+Newsreader fonts (SIL Open Font License 1.1, see `common/fonts/`), and the models you download, each
+covered by the license on its Hugging Face page.
+
+<br>
+
+<p align="center">
+  <a href="https://github.com/VarCode-ai/monad"><img src="docs/brand/monad-mark.svg" alt="Monad" width="32"></a><br>
+  <sub>OVMS Manager is a <a href="https://github.com/VarCode-ai/monad">Monad</a> app · local AI for OpenVINO</sub>
+</p>

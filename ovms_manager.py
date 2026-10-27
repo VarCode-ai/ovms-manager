@@ -28,10 +28,11 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QC
 
 APP_ID = "ovms-manager"  # = name of the .desktop file created by install.sh
 APP_VERSION = "1.0.0"    # compared with the latest GitHub release for update notifications
+APP_REPO = "VarCode-ai/ovms-manager"  # GitHub repository whose releases are checked for updates
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-if not os.path.exists(os.path.join(APP_DIR, "ui_kit.py")):  # running from the project: the kit is in ../common
-    sys.path.insert(0, os.path.join(os.path.dirname(APP_DIR), "common"))
-import ui_kit as kit  # noqa: E402  (shared UI kit of the ecosystem: themes, fonts, icons, command palette)
+if not os.path.exists(os.path.join(APP_DIR, "ui_kit.py")):  # running from the repository: the kit is in ./common
+    sys.path.insert(0, os.path.join(APP_DIR, "common"))
+import ui_kit as kit  # noqa: E402  (shared UI kit of the Monad apps: themes, fonts, icons, command palette)
 # Folder holding the OpenVINO models (shared with Lectern). Override with $OPENVINO_MODELS_DIR.
 MODELS_DIR = os.path.abspath(os.path.expanduser(os.environ.get("OPENVINO_MODELS_DIR") or "~/models"))
 _HOME = os.path.expanduser("~")
@@ -973,7 +974,7 @@ class OVMSManager(QMainWindow):
         self.local_only = bool(state.get("local_only", False))
         # new releases on GitHub: checked at most once a day, in the background (command palette to turn it off)
         self.updates = kit.UpdateChecker(self, APP_VERSION, lambda k, d=None: load_state().get(k, d),
-                                         lambda k, v: save_state(**{k: v}))
+                                         lambda k, v: save_state(**{k: v}), APP_REPO)
         self.palette_dlg = kit.CommandPalette(self, self._palette_commands, tr("Type a command or a model…"),
                                               tr("No results"))
         QShortcut(QKeySequence("Ctrl+K"), self, self.palette_dlg.open_palette)
@@ -1070,7 +1071,7 @@ class OVMSManager(QMainWindow):
         txt.setSpacing(0)
         b1 = QLabel("OVMS Manager")
         b1.setObjectName("brand")
-        b2 = QLabel("OpenVINO · Optimum · HF")
+        b2 = QLabel(f"{kit.FAMILY_NAME} · OpenVINO")  # the family the app belongs to
         b2.setObjectName("brandSub")
         txt.addWidget(b1)
         txt.addWidget(b2)
