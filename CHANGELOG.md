@@ -9,6 +9,15 @@ repository, then named `ai-app-local-openvino`, together with Lectern; its histo
 
 ## [Unreleased]
 
+## [1.1.1] — 2026-10-29
+
+### Fixed
+
+- Downloads with rootless Podman failed with "failed to make directory '/models/OpenVINO': Permission denied"
+  when `~/models` was not writable by everyone (the usual case, e.g. a folder created with the default 755
+  permissions). The download container now runs as your user, like the config.json updates already did, so
+  it can write in `~/models` and the downloaded files belong to you.
+
 ## [1.1.0] — 2026-10-27
 
 ### Monad
@@ -45,6 +54,7 @@ First public release.
 - English and Italian interface, per-user installer for every major glibc distribution, automatic fallback
   from GPU or NPU to the CPU, and update notifications that can be turned off.
 
-[Unreleased]: https://github.com/VarCode-ai/ovms-manager/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/VarCode-ai/ovms-manager/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/VarCode-ai/ovms-manager/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/VarCode-ai/ovms-manager/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/VarCode-ai/ovms-manager/releases/tag/v1.0.0

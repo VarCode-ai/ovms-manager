@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QC
                                QScrollArea)
 
 APP_ID = "ovms-manager"  # = name of the .desktop file created by install.sh
-APP_VERSION = "1.1.0"    # compared with the latest GitHub release for update notifications
+APP_VERSION = "1.1.1"    # compared with the latest GitHub release for update notifications
 APP_REPO = "VarCode-ai/ovms-manager"  # GitHub repository whose releases are checked for updates
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if not os.path.exists(os.path.join(APP_DIR, "ui_kit.py")):  # running from the repository: the kit is in ./common
@@ -154,8 +154,10 @@ def container_run(*args, devices=(), detach=False, name=None, ports=(), as_owner
     if RUNTIME == "docker":
         cmd += ["--user", f"{os.getuid()}:{os.getgid()}", *device_groups(list(devices))]
     elif as_owner:
-        # rootless Podman: root in the container is your user on the host, so it can rewrite config.json whoever
-        # created it (you, or the container user of an earlier run); the image's own user could not
+        # rootless Podman: root in the container is your user on the host, so it can write in ~/models and
+        # rewrite config.json whoever created them (you, or the container user of an earlier run). The image's
+        # own user (ovms, uid 5000) is a stranger on the host: with a ~/models that is not world-writable
+        # (the usual 755) it cannot even create ~/models/OpenVINO, and downloads fail with Permission denied
         cmd += ["--user", "0:0"]
     return cmd + EXTRA_RUN_ARGS + [OVMS_IMAGE, *args]
 
@@ -2292,7 +2294,8 @@ class OVMSManager(QMainWindow):
             t.log(tr("Download · {model}").format(model=model_id), "head")
             t.log(tr("Task: {task} · Destination: {folder}").format(task=ovms_task, folder=MODELS_DIR))
             ret = t.run_cmd(container_run("--pull", "--source_model", model_id,
-                                          "--model_repository_path", "/models", "--task", ovms_task))
+                                          "--model_repository_path", "/models", "--task", ovms_task,
+                                          as_owner=True))
             if ret == 0:
                 t.log(tr("Download complete! The model is in {folder}.").format(folder=MODELS_DIR), "ok")
             else:
