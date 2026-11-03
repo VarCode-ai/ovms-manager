@@ -123,7 +123,7 @@ Starts OVMS with the model and the accelerator you pick.
   | Mode | OpenVINO device | Notes |
   | --- | --- | --- |
   | Intel GPU | `GPU` | Fastest generation. Passes `/dev/dri` to the container. |
-  | Intel NPU | `NPU` | Low power, ideal on battery. Needs the NPU driver on the host. Prefer `INT4 CW` models. |
+  | Intel NPU | `NPU` | Low power, ideal on battery. The image carries the NPU driver and compiler: the host only needs the `intel_vpu` kernel module and the NPU firmware. Prefer `INT4 CW` models. |
   | Hybrid GPU + CPU | `MULTI:GPU,CPU` | Splits requests between GPU and CPU. |
   | CPU only | `CPU` | Works on any x86-64 machine. |
 
@@ -155,6 +155,9 @@ already converted and quantized. It is cached for 6 hours.
   or is larger than your memory (red), from the size of the repository.
 - **Download with OVMS** runs `ovms --pull` in a container, which downloads the model into `~/models` and
   prepares it for serving. *Custom repo* accepts any `author/name` repository id.
+- The *Speech-to-Text* models land in the same folder [Lectern](https://github.com/VarCode-ai/lectern) reads.
+  For Lectern on the NPU prefer the `INT8` Whisper models (`whisper-large-v3-turbo-int8-ov` for live
+  recording): they compile for the NPU in a few minutes the first time, the `INT4` ones take much longer.
 
 ### Local library
 
