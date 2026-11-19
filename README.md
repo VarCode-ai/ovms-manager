@@ -115,9 +115,11 @@ the bottom of the sidebar, then restart the app.
 
 ### Server
 
-Starts OVMS with the model and the accelerator you pick.
+Serve several local models at once through the same API on port 8000.
 
-- **Model**: every OpenVINO IR model found in `~/models`.
+- Under **Models to serve**, select a local model and its accelerator. Use **Add model** for each
+  additional model. For example, select an embeddings model on the GPU for semantic search and a
+  Whisper model on the CPU for audio transcription. The manager remembers each row.
 - **Hardware accelerator**:
 
   | Mode | OpenVINO device | Notes |
@@ -127,18 +129,22 @@ Starts OVMS with the model and the accelerator you pick.
   | Hybrid GPU + CPU | `MULTI:GPU,CPU` | Splits requests between GPU and CPU. |
   | CPU only | `CPU` | Works on any x86-64 machine. |
 
-  Each card shows whether the hardware was detected. *not Intel · unsupported* means the machine has a
+  Each accelerator choice shows whether the hardware was detected. *not Intel · unsupported* means the machine has a
   GPU or NPU from another vendor, which OpenVINO cannot use. *present · /dev not accessible* means the
   app runs in a sandbox (Flatpak, toolbox…) that hides the device.
-- **Start server** removes a previous `ovms-server` container, registers the model in
-  `~/models/config.json` and starts a new container. Then it follows the container log until the model
-  answers, which can take a few minutes the first time.
+- **Start server** applies all rows together. It prepares a deployment, replaces the `ovms-server`
+  container and reports when each model is ready. After changing a row, start the server again to
+  apply the change. **Stop** stops all the models in this deployment.
+- Use the model ID printed in the console in the `model` field of each request. For example,
+  send queries to `/v3/embeddings` with the embeddings model ID and recordings to
+  `/v3/audio/transcriptions` with the Whisper ID. Folders with the same API ID receive numeric
+  suffixes in row order.
 - **Verbose log** starts OVMS with `--log_level DEBUG`.
 - **Localhost only** publishes port 8000 on `127.0.0.1` only, so other computers on your network
   cannot reach the API. Leave it off if Open WebUI runs in a container (see below).
-- **Test API** behaves like a client: it lists the models and sends a short chat request.
+- **Test API** checks each configured model and sends a short chat request when a chat model is ready.
 - **Container log** shows the last 80 lines of the server log.
-- The chip next to the status shows the model the server is exposing.
+- Hover over the model count next to the server status to see the configured API IDs.
 - The **console** at the bottom stays folded to a single line with the latest message; click the arrow to
   open it. It opens by itself when an error arrives.
 
@@ -161,7 +167,7 @@ already converted and quantized. It is cached for 6 hours.
 
 ### Local library
 
-The models in `~/models`, with their size on disk. **Use in server** selects one on the Server page.
+The models in `~/models`, with their size on disk. **Use in server** adds the selected model to the Server page.
 **Delete** removes a model folder. If the files were created by the container with a different user ID,
 OVMS Manager deletes them through `podman unshare` or a short-lived container.
 
@@ -229,9 +235,10 @@ you download a model or start the server.
 
 | Path | Content |
 | --- | --- |
-| `~/models/` (or `$OPENVINO_MODELS_DIR`) | Models, and the `config.json` that OVMS reads. |
+| `~/models/` (or `$OPENVINO_MODELS_DIR`) | Local model library shared with other apps. |
 | `~/.cache/ovms_manager/hf_catalog.json` | Cached Hugging Face catalog. |
-| `~/.cache/ovms_manager/state.json` | Last served model name, the *Localhost only* setting and the interface language. |
+| `~/.cache/ovms_manager/state.json` | Selected models and accelerators, last deployed model IDs, *Localhost only* and interface language. |
+| `~/.local/share/ovms-manager/deployment/` | Server configuration and per-model runtime settings generated from the selected rows. |
 | `~/.local/share/ovms-manager/` | Installed app and Python environments. |
 
 ## Troubleshooting
@@ -242,7 +249,7 @@ you download a model or start the server.
 | The status pill shows *Docker error* | Your user cannot use Docker. Add it to the `docker` group (`sudo usermod -aG docker $USER`, then log out and back in) or use Podman. |
 | The container stops right away | Press **Container log**. Common causes: not enough memory for the model, or a device the model doesn't support (try the CPU mode). |
 | GPU mode fails with rootless Podman (`Context was not initialized`, permission denied on `/dev/dri`) | On some distributions the GPU is only accessible through your `render`/`video` group, which rootless containers drop by default. Start OVMS Manager with `OVMS_EXTRA_RUN_ARGS="--group-add keep-groups" ovms-manager` (requires the `crun` runtime, the default on recent distributions). |
-| *Model did not become available* | Large models can take more than 10 minutes on the first load. Check the log, then press **Start server** again: later loads are faster. |
+| *Still unavailable after 10 minutes* | Large models can take more than 10 minutes on the first load. Check the log, then press **Start server** again: later loads are faster. |
 | Converter: *optimum-cli not found* | Run `./install.sh --with-optimum` and restart the app. |
 
 More fixes are in [docs/troubleshooting.md](docs/troubleshooting.md), and the problems common to every

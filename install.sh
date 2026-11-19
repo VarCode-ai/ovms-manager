@@ -76,14 +76,26 @@ create_venv() {
     want="$("$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
     if [[ -x "$dir/bin/python" ]]; then
         have="$("$dir/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
-        [[ "$have" == "$want" ]] && return 0
-        echo "  (the environment uses Python ${have:-?}, recreating it with $want)"
-        rm -rf "$dir"
+        if [[ "$have" != "$want" ]]; then
+            echo "  (the environment uses Python ${have:-?}, recreating it with $want)"
+            rm -rf "$dir"
+        fi
     fi
-    if ! "$PYTHON" -m venv "$dir"; then
+    if [[ ! -x "$dir/bin/python" ]] && ! "$PYTHON" -m venv "$dir"; then
         rm -rf "$dir"
         echo "Cannot create a Python virtual environment. Install the venv module: $(distro_pkg python3-venv python3 python python3)" >&2
         exit 1
+    fi
+    # A reused or interrupted environment may have Python but no pip.
+    if ! "$dir/bin/python" -m pip --version >/dev/null 2>&1; then
+        echo "→ Bootstrapping pip in $dir"
+        if ! "$dir/bin/python" -m ensurepip --upgrade ||
+            ! "$dir/bin/python" -m pip --version >/dev/null 2>&1; then
+            echo "Cannot bootstrap pip in the Python $want environment." >&2
+            echo "Install venv/ensurepip support for $PYTHON: $(distro_pkg python3-venv python3 python python3)" >&2
+            echo "Or use another installed Python: PYTHON=python3.12 $0" >&2
+            exit 1
+        fi
     fi
 }
 
@@ -225,4 +237,10 @@ else
     echo "  To start it from a terminal add $BIN_DIR to your PATH."
 fi
 (( WITH_OPTIMUM )) || echo "  The Converter page needs optimum-intel: run again with --with-optimum to add it."
+echo "  Disk usage (GiB; excludes models, container images and pip cache):"
+du -sk "$VENV_DIR" | awk '{printf "    Python environment: %.2f GiB\n", $1 / 1048576}'
+if [[ -d "$OPTIMUM_VENV" ]]; then
+    du -sk "$OPTIMUM_VENV" | awk '{printf "    Converter environment: %.2f GiB\n", $1 / 1048576}'
+fi
+du -sk "$SUITE_DIR" | awk '{printf "    Installed app and environments: %.2f GiB\n", $1 / 1048576}'
 echo "  To remove it: $RUN_DIR/install.sh --uninstall"

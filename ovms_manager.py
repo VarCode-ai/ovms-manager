@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 """OVMS Manager — a desktop front end for OpenVINO Model Server, the Hugging Face OpenVINO catalog and Optimum."""
+import fcntl
 import glob
 import json
 import os
@@ -8,11 +9,14 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import sys
 import threading
 import time
 import webbrowser
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 from PySide6.QtCore import (QAbstractTableModel, QLibraryInfo, QLocale, QModelIndex, QPropertyAnimation, QRectF, QSize,
@@ -139,7 +143,7 @@ def device_groups(flags):
     return [x for gid in sorted(gids) for x in ("--group-add", str(gid))]
 
 
-def container_run(*args, devices=(), detach=False, name=None, ports=(), as_owner=False):
+def container_run(*args, devices=(), detach=False, name=None, ports=(), as_owner=False, deployment=None):
     """`<runtime> run` command for the OVMS image with ~/models mounted on /models.
     Volumes use the shared SELinux label (:z): with the private one (:Z) every new container would
     relabel ~/models and take access away from the server container that is already running.
@@ -151,6 +155,8 @@ def container_run(*args, devices=(), detach=False, name=None, ports=(), as_owner
     for port in ports:
         cmd += ["-p", port]
     cmd += ["-v", f"{MODELS_DIR}:/models:z", *devices]
+    if deployment is not None:
+        cmd += ["-v", f"{deployment}:/deployment:z"]
     if RUNTIME == "docker":
         cmd += ["--user", f"{os.getuid()}:{os.getgid()}", *device_groups(list(devices))]
     elif as_owner:
@@ -207,25 +213,25 @@ HARDWARE_MODES = {
     "GPU": {
         "title": N_("Intel GPU"), "icon": "gpu", "desc": N_("Fastest generation"),
         "device": "GPU",
-        "flags": ["--device", "/dev/dri"],
+        "nodes": ["/dev/dri"],
         "probe": "gpu",
     },
     "NPU": {
         "title": N_("Intel NPU"), "icon": "spark", "desc": N_("Cool and quiet, ideal on battery"),
         "device": "NPU",
-        "flags": ["--device", "/dev/accel:/dev/accel", "--device", "/dev/dri"],
+        "nodes": ["/dev/accel:/dev/accel", "/dev/dri"],
         "probe": "npu",
     },
     "MULTI": {
         "title": N_("Hybrid GPU + CPU"), "icon": "layers", "desc": N_("Parallel MULTI throughput"),
         "device": "MULTI:GPU,CPU",
-        "flags": ["--device", "/dev/dri"],
+        "nodes": ["/dev/dri"],
         "probe": "gpu",
     },
     "CPU": {
         "title": N_("CPU only"), "icon": "chip", "desc": N_("Works everywhere"),
         "device": "CPU",
-        "flags": [],
+        "nodes": [],
         "probe": None,
     },
 }
@@ -247,47 +253,170 @@ def load_state():
         return {}
 
 
+@contextmanager
+def file_lock(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
 def save_state(**values):
-    state = load_state()
-    state.update(values)
+    # Settings edits and server starts can come from different workers or windows.
     try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f)
+        with file_lock(Path(CACHE_DIR) / "state.lock"), tempfile.TemporaryDirectory(dir=CACHE_DIR) as tmp:
+            state = load_state()
+            state.update(values)
+            pending = Path(tmp) / "state.json"
+            pending.write_text(json.dumps(state))
+            pending.replace(STATE_FILE)
     except OSError:
         pass
 
 
-def _drop_named(node, name):
-    """Recursively remove from lists the items named `name` (also inside {"config": {...}})."""
-    if isinstance(node, dict):
-        return {k: _drop_named(v, name) for k, v in node.items()}
-    if isinstance(node, list):
-        return [_drop_named(e, name) for e in node
-                if not (isinstance(e, dict) and name in (e.get("name"), (e.get("config") or {}).get("name")))]
-    return node
+def device_flags(modes):
+    nodes = dict.fromkeys(node for mode in modes for node in HARDWARE_MODES[mode]["nodes"])
+    return [arg for node in nodes for arg in ("--device", node)]
 
 
-def config_has_model(path, name):
-    """True if config.json has an entry with that name (or if the file exists but cannot be read)."""
-    if not os.path.exists(path):
-        return False
-    try:
-        with open(path) as f:
-            cfg = json.load(f)
-    except (OSError, ValueError):
-        return True
-    return _drop_named(cfg, name) != cfg
+def deployment_names(paths):
+    """Keep existing API IDs where possible, including when two repositories have the same basename."""
+    names = {}
+    reserved = {served_name_for(path) for path in paths}
+    for path in paths:
+        base = served_name_for(path)
+        name = base
+        suffix = 2
+        while name in names.values() or (name != base and name in reserved):
+            name = f"{base}-{suffix}"
+            suffix += 1
+        names[path] = name
+    return names
 
 
-def remove_model_from_config(path, name):
-    """Rewrite config.json in place, without the entry `name`. In place on purpose: replacing the file would
-    change its owner and permissions, and the OVMS container could no longer write it."""
-    with open(path, "r+") as f:
-        cfg = json.load(f)
-        f.seek(0)
-        f.truncate()
-        json.dump(_drop_named(cfg, name), f, indent=2)
+# Text-format protobuf strings may contain JSON, braces and text that looks like another field.
+_GRAPH_TOKENS = re.compile(r"""\#[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[\w.]+|[^\s]""")
+_GRAPH_DEVICES = {
+    "mediapipe.LLMCalculatorOptions": "device",
+    "mediapipe.ImageGenCalculatorOptions": "device",
+    "mediapipe.EmbeddingsCalculatorOVOptions": "target_device",
+    "mediapipe.RerankCalculatorOVOptions": "target_device",
+    "mediapipe.S2tCalculatorOptions": "target_device",
+    "mediapipe.T2sCalculatorOptions": "target_device",
+}
+
+
+def graph_with_device(graph, device, *, embedding_max_length=None):
+    """Select the device and supply a default embedding length when the graph omits it."""
+    tokens = [m for m in _GRAPH_TOKENS.finditer(graph) if not m[0].startswith("#")]
+    words = [m[0] for m in tokens]
+    edits = []
+    for i, word in enumerate(words):
+        field = _GRAPH_DEVICES.get(word)
+        if not field or words[i + 1:i + 2] != ["]"]:
+            continue
+        start = i + (3 if words[i + 2:i + 3] == [":"] else 2)
+        if start >= len(words) or words[start] not in ("{", "<"):
+            continue
+        found_device = False
+        needs_length = word == "mediapipe.EmbeddingsCalculatorOVOptions" and embedding_max_length is not None
+        depth = 1
+        for j in range(start + 1, len(tokens)):
+            if words[j] in ("}", ">"):
+                depth -= 1
+                if depth == 0:
+                    pos = tokens[start].end()
+                    fields = []
+                    if not found_device:
+                        fields.append(f'{field}: "{device}"')
+                    if needs_length:
+                        fields.append(f"max_length: {embedding_max_length}")
+                    if fields:
+                        edits.append((pos, pos, "\n  " + "\n  ".join(fields) + "\n"))
+                    break
+            elif words[j] in ("{", "<"):
+                depth += 1
+            elif depth == 1 and words[j:j + 2] == [field, ":"] and j + 2 < len(tokens):
+                value = tokens[j + 2]
+                edits.append((value.start(), value.end(), f'"{device}"'))
+                found_device = True
+            elif depth == 1 and words[j:j + 2] == ["max_length", ":"]:
+                needs_length = False
+    for start, end, value in sorted(edits, reverse=True):
+        graph = graph[:start] + value + graph[end:]
+    return graph, len(edits)
+
+
+def prepare_deployment(folder, models, task):
+    """Build private runtime files. OVMS sees the weights in /models and these files in /deployment."""
+    configs, chat_models = [], []
+    names = deployment_names(models)
+    for index, (rel, mode) in enumerate(models.items()):
+        name = names[rel]
+        device = HARDWARE_MODES[mode]["device"]
+        task.log(tr("Starting server · {model} on {device} · name: {name}").format(
+            model=rel, device=device, name=name), "head")
+        source = Path(MODELS_DIR) / rel
+        base = Path("/models") / rel
+        cfg = {"name": name, "base_path": str(base)}
+        graph = source / "graph.pbtxt"
+        subconfig = source / "subconfig.json"
+        xml = list(source.glob("*.xml"))
+        graph_text = ""
+        # OVMS uses 1000 tokens in its NPU example for this Qwen embedding model.
+        qwen_npu_embeddings = device == "NPU" and source.name.casefold() == "qwen3-embedding-0.6b-int8-ov"
+        embedding_max_length = 1000 if qwen_npu_embeddings else None
+        if graph.is_file():
+            # Graph paths and relative model paths are resolved against the original model directory.
+            graph_text, count = graph_with_device(graph.read_text(), device, embedding_max_length=embedding_max_length)
+            if not count and not subconfig.is_file():
+                raise ValueError(tr("Cannot set the accelerator for the graph in {model}.").format(model=rel))
+            graph_file = f"graph-{index}.pbtxt"
+            (folder / graph_file).write_text(graph_text)
+            cfg["graph_path"] = f"/deployment/{graph_file}"
+            if subconfig.is_file():
+                # Older graphs delegate inference to classic models defined in their subconfig.
+                sub = json.loads(subconfig.read_text())
+                for item in sub["model_config_list"]:
+                    model = item["config"]
+                    model["target_device"] = device
+                    model["base_path"] = str(base / model.get("base_path", model["name"]))
+                sub_file = f"subconfig-{index}.json"
+                (folder / sub_file).write_text(json.dumps(sub))
+                cfg["subconfig"] = f"/deployment/{sub_file}"
+        elif (xml and (source / "config.json").is_file()) or (source / "model_index.json").is_file():
+            # Let OVMS infer the task from local Hugging Face metadata and generate its graph.
+            # The temporary model view shares the weights and keeps generated files out of the library.
+            view = folder / str(index)
+            view.mkdir()
+            for entry in source.iterdir():
+                if entry.name not in ("graph.pbtxt", "subconfig.json"):
+                    (view / entry.name).symlink_to(base / entry.name)
+            length_args = ["--max_length", str(embedding_max_length)] if qwen_npu_embeddings else []
+            ret = task.run_cmd(container_run("--configure", "--model_path", f"/deployment/{index}",
+                                             "--model_name", name, "--target_device", device, *length_args,
+                                             deployment=folder, as_owner=True))
+            if ret:
+                raise ValueError(tr("Could not configure {model} for {device}.").format(model=rel, device=device))
+            cfg["base_path"] = f"/deployment/{index}"
+            graph_text = (view / "graph.pbtxt").read_text()
+        else:
+            cfg["target_device"] = device
+            if len(xml) == 1:
+                cfg["base_path"] = str(base / xml[0].name)
+        configs.append({"config": cfg})
+        if "LLMCalculator" in graph_text:
+            chat_models.append(name)
+    (folder / "config.json").write_text(json.dumps({"model_config_list": configs}, indent=2))
+    # Rootless Podman serves as the image user. A restrictive host umask must still allow it
+    # to read the generated files through the bind mount.
+    for root, _, files in os.walk(folder):
+        Path(root).chmod(0o755)
+        for filename in files:
+            path = Path(root) / filename
+            if not path.is_symlink():
+                path.chmod(0o644)
+    return list(names.values()), chat_models
 
 
 # PCI classes (lspci -n): 03xx = display controller, 1200 = processing accelerator (NPU)
@@ -316,6 +445,15 @@ def pci_devices():
         if m:
             pci.append((m.group(2), m.group(1)))
     return pci or None
+
+
+def selinux_restricts_container_devices():
+    selinux = Path("/sys/fs/selinux")
+    try:
+        return (selinux.joinpath("enforce").read_text().strip() == "1"
+                and selinux.joinpath("booleans/container_use_devices").read_text().split()[:1] == ["0"])
+    except OSError:
+        return False
 
 
 def detect_accelerators():
@@ -417,10 +555,6 @@ QMainWindow, #root, QDialog {{ background: {t['bg']}; }}
 #pageSub {{ color: {t['muted']}; font-size: 13px; }}
 #card {{ background: {t['surface']}; border: none; border-radius: {r['xl']}px; }}
 #cardTitle {{ font-size: 14px; font-weight: 650; }}
-QPushButton#hwCard {{ text-align: left; padding: 14px; border-radius: {r['lg']}px; background: {t['surface2']};
-    border: 1px solid {t['border']}; }}
-QPushButton#hwCard:hover {{ border-color: {t['border_strong']}; }}
-QPushButton#hwCard:checked {{ border: 2px solid {t['accent']}; background: {t['accent_soft']}; }}
 QCheckBox::indicator {{ width: 34px; height: 18px; border-radius: 9px; background: {t['border_strong']}; }}
 QCheckBox::indicator:checked {{ background: {t['accent']}; }}
 QTableView {{ background: {t['surface']}; border: none; border-radius: {r['xl']}px; gridline-color: transparent;
@@ -972,7 +1106,12 @@ class OVMSManager(QMainWindow):
         self.selected_model = None
         self.stop_wait = threading.Event()
         state = load_state()
-        self.served_name = state.get("served_name")
+        self.saved_rows = state.get("server_rows")
+        legacy = state.get("served_name")
+        self.served_names = state.get("served_names", [legacy] if legacy else [])
+        self.chat_names = state.get("chat_names", [legacy] if legacy and detect_category(legacy, None) == "llm" else [])
+        self.deployment_dir = Path(DATA_DIR) / APP_ID / "deployment"
+        self.server_lock_path = self.deployment_dir.with_name("server.lock")
         self.local_only = bool(state.get("local_only", False))
         # new releases on GitHub: checked at most once a day, in the background (command palette to turn it off)
         self.updates = kit.UpdateChecker(self, APP_VERSION, lambda k, d=None: load_state().get(k, d),
@@ -1223,81 +1362,32 @@ class OVMSManager(QMainWindow):
         lay.setSpacing(16)
 
         head = QHBoxLayout()
-        head.addWidget(page_header(tr("OVMS server"), tr("Start OpenVINO Model Server with the model and the "
-                                                         "accelerator of your choice.")), 1)
-        self.chip_model = kit.Chip("server", tr("No model served"), "neutral", tr("Model exposed by the server"))
+        head.addWidget(page_header(tr("OVMS server"), tr("Serve your local models together on one endpoint.")), 1)
+        self.chip_model = kit.Chip("server", tr("No model served"), "neutral", tr("Models configured on the running server"))
         head.addWidget(self.chip_model, 0, Qt.AlignTop)
         head.addSpacing(6)
         self.pill = StatusPill()
         head.addWidget(self.pill, 0, Qt.AlignTop)
         lay.addLayout(head)
 
-        c1, l1 = card(tr("Model"), tr("OpenVINO IR models found in {folder}").format(folder=MODELS_LABEL))
-        row = QHBoxLayout()
-        self.cb_models = QComboBox()
-        self.cb_models.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        row.addWidget(self.cb_models, 1)
-        row.addWidget(kit.IconButton("refresh", tr("Refresh"), slot=self.refresh_local_models))
-        row.addWidget(kit.IconButton("explore", tr("Find models"), slot=lambda: self.nav.setCurrentRow(1)))
-        l1.addLayout(row)
+        c1, l1 = card(tr("Models to serve"), tr("Choose a model and its accelerator on each row."))
+        self.model_rows = []
+        self.refreshing_rows = False
+        self.local_models = []
+        self.accelerators = detect_accelerators()
+        self.empty_models = QLabel(tr("No models — download one from Explore Hugging Face"))
+        self.empty_models.setObjectName("hint")
+        l1.addWidget(self.empty_models)
+        self.rows_layout = QVBoxLayout()
+        l1.addLayout(self.rows_layout)
+        actions = QHBoxLayout()
+        self.btn_add_model = button(tr("Add model"), slot=lambda: self._add_server_row())
+        actions.addWidget(self.btn_add_model)
+        actions.addStretch()
+        actions.addWidget(kit.IconButton("refresh", tr("Refresh"), slot=self.refresh_local_models))
+        actions.addWidget(kit.IconButton("explore", tr("Find models"), slot=lambda: self.nav.setCurrentRow(1)))
+        l1.addLayout(actions)
         lay.addWidget(c1)
-
-        c2, l2 = card(tr("Hardware accelerator"))
-        grid = QGridLayout()
-        grid.setSpacing(12)
-        self.hw_group = QButtonGroup(self)
-        self.hw_group.setExclusive(True)
-        accel = detect_accelerators()
-        first_ok = None
-        for i, (key, hw) in enumerate(HARDWARE_MODES.items()):
-            status = "ok" if hw["probe"] is None else accel[hw["probe"]]
-            state, color_key = {"ok": (tr("detected"), "ok"),
-                                "hidden": (tr("present · /dev not accessible"), "warn"),
-                                "other": (tr("not Intel · unsupported"), "warn"),
-                                "missing": (tr("not detected"), "muted")}[status]
-            b = QPushButton()
-            b.setObjectName("hwCard")
-            b.setCheckable(True)
-            b.setCursor(Qt.PointingHandCursor)
-            b.setMinimumHeight(92)
-            inner = QVBoxLayout(b)
-            inner.setContentsMargins(14, 10, 14, 10)
-            top = ThemedLabel(lambda hw=hw: f"<b>{tr(hw['title'])}</b>")
-            pic = QLabel()
-
-            def draw(pic=pic, name=hw["icon"]):
-                pic.setPixmap(kit.icon(name, C["accent_text"], 22).pixmap(22, 22))
-            draw()
-            kit.signals.changed.connect(draw)
-            title_row = QHBoxLayout()
-            title_row.setSpacing(8)
-            title_row.addWidget(pic)
-            title_row.addWidget(top, 1)
-            desc = QLabel(tr(hw["desc"]))
-            desc.setObjectName("hint")
-            st = ThemedLabel(lambda k=color_key, state=state, hw=hw: f"<span style='color:{C[k]}'>● {state}</span> · "
-                                                                    f"<span style='color:{C['muted']}'>{hw['device']}</span>")
-            st.setStyleSheet("font-size: 11px;")
-            inner.addLayout(title_row)
-            for w in (pic, top, desc, st):
-                w.setAttribute(Qt.WA_TransparentForMouseEvents)
-            inner.addWidget(desc)
-            inner.addWidget(st)
-            if status == "hidden":
-                node = DEVICE_NODES[hw["probe"]]
-                b.setToolTip(tr("The hardware is present, but {node} is not visible to this process (is the app "
-                                "running in a sandbox?).\nThe container will not get it: start the app from a "
-                                "regular terminal or expose the device to the sandbox.").format(node=node))
-            elif status == "other":
-                b.setToolTip(tr("OpenVINO supports Intel GPUs and NPUs only: use the CPU mode on this machine."))
-            b.setProperty("hw", key)
-            self.hw_group.addButton(b)
-            grid.addWidget(b, 0, i)
-            if first_ok is None and status == "ok":
-                first_ok = b
-        (first_ok or self.hw_group.buttons()[-1]).setChecked(True)
-        l2.addLayout(grid)
-        lay.addWidget(c2)
 
         c3, l3 = card(tr("Controls"))
         ctrl = QHBoxLayout()
@@ -1663,15 +1753,80 @@ class OVMSManager(QMainWindow):
                 dirs[:] = []  # don't descend into subfolders (e.g. unet/, text_encoder/)
         return found
 
+    def _add_server_row(self, path=None, mode=None):
+        selected = {model.currentData() for _, model, _ in self.model_rows}
+        path = path or next((p for p in self.local_models if p not in selected), None)
+        if path is None:
+            return
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        model = QComboBox()
+        model.setAccessibleName(tr("Model"))
+        model.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        for rel in self.local_models:
+            model.addItem(rel, rel)
+        if path not in self.local_models:
+            model.addItem(tr("{model} (missing)").format(model=path), path)
+        model.setCurrentIndex(model.findData(path))
+        layout.addWidget(model, 1)
+        hardware = QComboBox()
+        hardware.setAccessibleName(tr("Hardware accelerator"))
+        first_ok = None
+        for key, hw in HARDWARE_MODES.items():
+            status = self.accelerators.get(hw["probe"], "ok")
+            label = {"ok": tr("detected"), "hidden": tr("present · /dev not accessible"),
+                     "other": tr("not Intel · unsupported"), "missing": tr("not detected")}[status]
+            hardware.addItem(kit.icon(hw["icon"], C["muted"], 16), f"{tr(hw['title'])} · {label}", key)
+            hardware.setItemData(hardware.count() - 1, tr(hw["desc"]), Qt.ToolTipRole)
+            if first_ok is None and status == "ok":
+                first_ok = key
+        hardware.setCurrentIndex(hardware.findData(mode if mode in HARDWARE_MODES else first_ok))
+        layout.addWidget(hardware)
+        layout.addWidget(kit.IconButton("delete", tooltip=tr("Remove from server configuration"),
+                                        slot=lambda: self._remove_server_row(row)))
+        self.model_rows.append((row, model, hardware))
+        self.rows_layout.addWidget(row)
+        model.currentIndexChanged.connect(self._save_server_rows)
+        hardware.currentIndexChanged.connect(self._save_server_rows)
+        self._save_server_rows()
+
+    def _remove_server_row(self, row):
+        self.model_rows = [entry for entry in self.model_rows if entry[0] is not row]
+        self.rows_layout.removeWidget(row)
+        row.deleteLater()
+        self._save_server_rows()
+
+    def _save_server_rows(self):
+        rows = [[m.currentData(), hw.currentData()] for _, m, hw in self.model_rows]
+        self.btn_add_model.setEnabled(bool(set(self.local_models) - {path for path, _ in rows}))
+        if not self.refreshing_rows and rows != self.saved_rows:
+            self.saved_rows = rows
+            save_state(server_rows=rows)
+
+    def _use_server_model(self, rel):
+        if not any(model.currentData() == rel for _, model, _ in self.model_rows):
+            self._add_server_row(rel)
+        self.nav.setCurrentRow(0)
+
     def refresh_local_models(self):
-        current = self.cb_models.currentText()
         found = self.scan_local_models()
-        self.cb_models.clear()
-        self.cb_models.addItems(found)
-        if current in found:
-            self.cb_models.setCurrentText(current)
-        if not found:
-            self.cb_models.setPlaceholderText(tr("No models — download one from Explore Hugging Face"))
+        self.local_models = found
+        self.empty_models.setVisible(not found)
+        rows = self.saved_rows
+        if rows is None:
+            first = next((rel for rel in found if served_name_for(rel) in self.served_names), next(iter(found), None))
+            rows = [(first, None)] if first else []
+        self.refreshing_rows = True
+        for row, _, _ in self.model_rows.copy():
+            self._remove_server_row(row)
+        for path, mode in rows:
+            self._add_server_row(path, mode)
+        self.refreshing_rows = False
+        if found or self.saved_rows is not None:
+            self._save_server_rows()
+        else:
+            self.btn_add_model.setEnabled(False)
 
         self.lib_list.clear()
         total = 0
@@ -1691,8 +1846,7 @@ class OVMSManager(QMainWindow):
     def _use_library_model(self, item):
         if not item:
             return
-        self.cb_models.setCurrentText(item.data(Qt.UserRole))
-        self.nav.setCurrentRow(0)
+        self._use_server_model(item.data(Qt.UserRole))
 
     def open_library_folder(self):
         item = self.lib_list.currentItem()
@@ -1746,6 +1900,10 @@ class OVMSManager(QMainWindow):
             return errors or [(path, OSError(tr("the folder still exists")))]
 
         def done(errors):
+            if not errors:
+                for row, model, _ in self.model_rows.copy():
+                    if model.currentData() == rel:
+                        self._remove_server_row(row)
             self.refresh_local_models()
             if not errors:
                 self.log(tr("Model deleted: {model}").format(model=rel), "ok")
@@ -1773,14 +1931,13 @@ class OVMSManager(QMainWindow):
 
         def probe(_task):
             try:
-                res = subprocess.run(runtime_cmd("ps", "--filter", f"name={CONTAINER_NAME}", "--format",
-                                                 "{{.Status}}"),
+                res = subprocess.run(runtime_cmd("ps", "--format", "{{.Names}}"),
                                      capture_output=True, text=True, timeout=10)
             except (OSError, subprocess.TimeoutExpired):
                 return None
             if res.returncode != 0:
                 return "error"
-            return res.stdout.strip()
+            return CONTAINER_NAME in res.stdout.splitlines()
 
         def apply(status):
             if status is None:
@@ -1789,13 +1946,15 @@ class OVMSManager(QMainWindow):
                 self.pill.set_state(tr("{runtime} error").format(runtime=RUNTIME_NAME), "warn", False)
                 self.pill.setToolTip(tr("`{command}` failed. With Docker, make sure your user may use it (docker "
                                         "group or rootless Docker).").format(command=f"{RUNTIME} ps"))
-            elif status.startswith("Up"):
+            elif status:
                 self.pill.set_state(tr("RUNNING · port {port}").format(port=OVMS_PORT), "ok", True)
-                self.chip_model.set(self.served_name or "—", kind="accent")
+                label = (tr("{n} models").format(n=len(self.served_names)) if len(self.served_names) > 1
+                         else next(iter(self.served_names), "—"))
+                self.chip_model.set(label, kind="accent", tooltip="\n".join(self.served_names))
                 return
             else:
                 self.pill.set_state(tr("STOPPED"), "err", False)
-            self.chip_model.set(tr("No model served"), kind="neutral")
+            self.chip_model.set(tr("No model served"), kind="neutral", tooltip="")
 
         task = Task(probe, self)
         task.is_status = True
@@ -1805,85 +1964,69 @@ class OVMSManager(QMainWindow):
         task.start()
 
     def start_server(self):
-        if not self.require_runtime():
+        if not self.btn_start.isEnabled() or not self.btn_stop.isEnabled() or not self.require_runtime():
             return
-        model_rel_path = self.cb_models.currentText()
-        if not model_rel_path:
+        models = {}
+        for _, model, hardware in self.model_rows:
+            path = model.currentData()
+            if path not in self.local_models or not (Path(MODELS_DIR) / path).is_dir():
+                self.log(tr("Model folder missing: {model}").format(model=path), "err")
+                return
+            if path in models:
+                self.log(tr("Select {model} only once.").format(model=path), "err")
+                return
+            models[path] = hardware.currentData()
+        if not models:
             self.log(tr("No model selected. Download one from the Explore section."), "err")
             return
-        hw = HARDWARE_MODES[self.hw_group.checkedButton().property("hw")]
-        target_device = hw["device"]
-        debug = self.chk_debug.isChecked()
+        args = ["--rest_port", str(OVMS_PORT), "--config_path", "/deployment/config.json"]
+        if self.chk_debug.isChecked():
+            args += ["--log_level", "DEBUG"]
         bind = f"{OVMS_HOST}:" if self.chk_local.isChecked() else ""
-        served_name = served_name_for(model_rel_path)
-        category = detect_category(model_rel_path, None)
-        if category not in ("llm", "vlm"):
-            self.log(tr("Note: {model} looks like a “{type}” model, not a chat model: Open WebUI will not list it "
-                        "among the chat models.").format(model=model_rel_path, type=tr(CATEGORIES[category][0])),
-                     "warn")
+        self.stop_wait.clear()
 
         def job(t):
-            t.log(tr("Starting server · {model} on {device} · name: {name}").format(
-                model=model_rel_path, device=target_device, name=served_name), "head")
-            t.log(tr("Stopping any existing container…"))
-            subprocess.run(runtime_cmd("stop", CONTAINER_NAME), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(runtime_cmd("rm", CONTAINER_NAME), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-            config_path = os.path.join(MODELS_DIR, "config.json")
-            # entries registered by previous starts must go, otherwise OVMS would still serve the old
-            # model, or refuse the new entry ("name already occupied")
-            stale = [n for n in dict.fromkeys([served_name, load_state().get("served_name"), FALLBACK_MODEL_NAME])
-                     if n and config_has_model(config_path, n)]
-            for name in stale:
-                t.log(tr("Removing the previous entry “{name}” from config.json…").format(name=name))
-                try:
-                    remove_model_from_config(config_path, name)
-                except (OSError, ValueError) as e:
-                    t.log(tr("Cannot edit config.json directly ({error}): letting OVMS do it.").format(error=e),
-                          "warn")
-                if config_has_model(config_path, name):
-                    t.run_cmd(container_run("--remove_from_config", "--config_path", "/models/config.json",
-                                            "--model_name", name, as_owner=True))
-                if config_has_model(config_path, name):
-                    t.log(tr("The entry “{name}” is still in {path}: fix the file permissions or delete it, then "
-                             "try again.").format(name=name, path=config_path), "err")
+            live = self.deployment_dir
+            with file_lock(self.server_lock_path), tempfile.TemporaryDirectory(dir=live.parent) as tmp:
+                staged = Path(tmp) / "deployment"
+                staged.mkdir(mode=0o755)
+                names, chats = prepare_deployment(staged, models, t)
+                if self.stop_wait.is_set():
                     return
-
-            t.log(tr("Registering the model in the config for {device}…").format(device=target_device))
-            ret = t.run_cmd(container_run("--add_to_config", "--config_path", "/models/config.json",
-                                          "--model_path", model_rel_path, "--model_name", served_name,
-                                          "--target_device", target_device, as_owner=True))
-            if ret != 0:
-                t.log(tr("Registration in the config failed (exit code {code}): server not started.")
-                      .format(code=ret), "err")
-                if any("cannot open" in line for line in t.output_tail):
-                    t.log(tr("The container cannot write {path}: check its owner and permissions (ls -l), or delete "
-                             "it and start the server again.").format(path=config_path), "err")
-                return
-            save_state(served_name=served_name)
-            self.served_name = served_name
-
-            t.log(tr("Starting the OVMS container…"))
-            args = ["--rest_port", str(OVMS_PORT), "--config_path", "/models/config.json"]
-            if debug:
-                args += ["--log_level", "DEBUG"]
-            cmd = container_run(*args, devices=hw["flags"], detach=True, name=CONTAINER_NAME,
-                                ports=[f"{bind}{OVMS_PORT}:{OVMS_PORT}"])
-            if t.run_cmd(cmd) != 0:
-                t.log(tr("Error starting the container."), "err")
-                return
-            t.log(tr("Container started. Waiting for OVMS to load the model (it can take a few minutes)…"))
-            self._wait_until_ready(t, served_name)
+                t.log(tr("Stopping any existing container…"))
+                if not self._remove_server(t):
+                    return
+                if live.exists():
+                    live.rename(Path(tmp) / "previous")
+                staged.rename(live)
+                cmd = container_run(*args, devices=device_flags(models.values()), detach=True, name=CONTAINER_NAME,
+                                    ports=[f"{bind}{OVMS_PORT}:{OVMS_PORT}"], deployment=live)
+                if t.run_cmd(cmd) != 0:
+                    t.log(tr("Error starting the container."), "err")
+                    return
+                self.served_names, self.chat_names = names, chats
+                save_state(served_names=names, chat_names=chats)
+            self._wait_until_ready(t, names, npu_requested="NPU" in models.values())
 
         self.run_task(job, tr("Starting server"), [self.btn_start], lambda _: self.check_server_status())
 
-    def _wait_until_ready(self, t, name, timeout=600):
-        """Follow the container logs until the model answers on /v3/models, or the container dies."""
+    def _remove_server(self, t):
+        res = subprocess.run(runtime_cmd("ps", "-a", "--format", "{{.Names}}"), capture_output=True, text=True)
+        if res.returncode:
+            t.log(res.stderr.strip() or tr("{runtime} error").format(runtime=RUNTIME_NAME), "err")
+            return False
+        if CONTAINER_NAME in res.stdout.splitlines():
+            return (t.run_cmd(runtime_cmd("stop", CONTAINER_NAME)) == 0
+                    and t.run_cmd(runtime_cmd("rm", CONTAINER_NAME)) == 0)
+        return True
+
+    def _wait_until_ready(self, t, names, timeout=600, *, npu_requested=False):
+        """Follow container logs until every requested model is ready or the container exits."""
         printed = 0
         last_status = 0
         start = time.time()
-        self.stop_wait.clear()
-        while time.time() - start < timeout:
+        pending = list(names)
+        while time.time() - start < timeout and not self.stop_wait.is_set():
             # state first, then logs: if the container just died, the logs read afterwards are complete
             try:
                 state = subprocess.run(runtime_cmd("inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}",
@@ -1899,6 +2042,13 @@ class OVMSManager(QMainWindow):
                 low = line.lower()
                 level = "err" if any(k in low for k in ("[error]", "[critical]", "error:", "exception")) else "info"
                 t.log("  " + line.strip(), level)
+                if npu_requested and "available devices for open vino:" in low:
+                    devices = low.partition("available devices for open vino:")[2]
+                    if not re.search(r"\bnpu\b", devices) and selinux_restricts_container_devices():
+                        t.log(tr("OVMS cannot see the selected NPU. Check for SELinux denials on accel0 with "
+                                 "sudo ausearch -m AVC -ts recent -i. If SELinux denied OVMS access, run "
+                                 "sudo setsebool -P container_use_devices on and restart the server. "
+                                 "This setting persists across reboots and applies to all containers on the host."), "warn")
             printed = max(printed, len(lines))
 
             if not state or state[0] != "true":
@@ -1907,10 +2057,12 @@ class OVMSManager(QMainWindow):
                       .format(code=code), "err")
                 return
 
-            rest_up, ready, ids = self._probe_ovms(name)
-            if ready:
+            rest_up, ready, ids = self._probe_ovms(pending)
+            for name in ready:
+                pending.remove(name)
                 t.log(tr("Model ready in {seconds} s! OpenAI endpoint: {url} · model name: {name}").format(
                     seconds=int(time.time() - start), url=f"{OVMS_URL}/v3", name=name), "ok")
+            if not pending:
                 t.log(tr("In Open WebUI: Admin Settings → Connections → OpenAI API → “+”, URL {url} (if Open WebUI "
                          "runs in a container: {container_url}), any API key.").format(
                     url=f"{OVMS_URL}/v3", container_url=CONTAINER_URL), "ok")
@@ -1922,7 +2074,7 @@ class OVMSManager(QMainWindow):
                 if not rest_up:
                     what = tr("the REST server on port {port} is not answering yet").format(port=OVMS_PORT)
                 else:
-                    what = tr("the server answers, but “{name}” is not ready yet").format(name=name)
+                    what = tr("waiting for {models}").format(models=", ".join(pending))
                     if ids:
                         what += " " + tr("(exposed models: {models})").format(models=", ".join(ids))
                 t.log(tr("⏳ {seconds} s · {status}. You can interrupt with “Stop”.").format(seconds=elapsed,
@@ -1931,27 +2083,33 @@ class OVMSManager(QMainWindow):
             if self.stop_wait.wait(3):
                 t.log(tr("Wait interrupted."), "warn")
                 return
-        t.log(tr("The model did not become available within {minutes} minutes: check the log.")
-              .format(minutes=timeout // 60), "err")
+        if not self.stop_wait.is_set():
+            t.log(tr("Still unavailable after {minutes} minutes: {models}").format(
+                minutes=timeout // 60, models=", ".join(pending)), "err")
 
-    def _probe_ovms(self, name):
-        """Return (REST server reachable, model ready, ids exposed on /v3/models)."""
+    def _probe_ovms(self, names):
+        """Discover generative models once, then check KServe readiness for any other IDs."""
         rest_up, ids = False, []
         try:
             r = requests.get(f"{OVMS_URL}/v3/models", timeout=3)
             rest_up = True
             if r.ok:
-                ids = [m.get("id") for m in r.json().get("data", [])]
+                ids = [m["id"] for m in r.json().get("data", []) if m.get("id")]
         except (requests.RequestException, ValueError):
             pass
-        if name in ids:
-            return True, True, ids
-        try:
-            # some model types (e.g. speech2text) may not show up in /v3/models
-            r = requests.get(f"{OVMS_URL}/v2/models/{name}/ready", timeout=3)
-            return True, r.status_code == 200, ids
-        except requests.RequestException:
-            return rest_up, False, ids
+        ready = []
+        for name in names:
+            if name in ids:
+                ready.append(name)
+                continue
+            try:
+                r = requests.get(f"{OVMS_URL}/v2/models/{name}/ready", timeout=3)
+                rest_up = True
+                if r.status_code == 200:
+                    ready.append(name)
+            except requests.RequestException:
+                pass
+        return rest_up, ready, ids
 
     def show_container_logs(self):
         if not self.require_runtime():
@@ -1968,51 +2126,53 @@ class OVMSManager(QMainWindow):
         self.run_task(job, tr("Reading container log"))
 
     def stop_server(self):
-        if not self.require_runtime():
+        if not self.btn_stop.isEnabled() or not self.require_runtime():
             return
         self.stop_wait.set()  # interrupts a wait for the model in progress
 
         def job(t):
             t.log(tr("Stopping the server…"), "head")
-            subprocess.run(runtime_cmd("stop", CONTAINER_NAME), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            subprocess.run(runtime_cmd("rm", CONTAINER_NAME), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            t.log(tr("Server stopped."), "ok")
+            with file_lock(self.server_lock_path):
+                if self._remove_server(t):
+                    t.log(tr("Server stopped."), "ok")
 
-        self.run_task(job, tr("Stopping server"), [self.btn_start, self.btn_stop], lambda _: self.check_server_status())
+        self.run_task(job, tr("Stopping server"), [self.btn_stop], lambda _: self.check_server_status())
 
     def test_api(self):
         """Test the API the way Open WebUI would: model list + a real chat request."""
         base = f"{OVMS_URL}/v3"
 
+        names, chat_names = self.served_names.copy(), self.chat_names.copy()
+
         def job(t):
             t.log(tr("OVMS OpenAI API test"), "head")
-            try:
-                r = requests.get(f"{base}/models", timeout=5)
-            except requests.RequestException as e:
-                t.log("1/2 ✗ " + tr("{url} unreachable: {error}").format(url=f"{base}/models", error=e), "err")
+            rest_up, ready, ids = self._probe_ovms(names)
+            if not rest_up:
                 t.log(tr("The server is not listening: start it or check “Container log”."), "err")
                 return
-            if not r.ok:
-                t.log(f"1/2 ✗ {base}/models → HTTP {r.status_code}: {r.text[:300]}", "err")
+            for name in names:
+                if name in ready:
+                    t.log(tr("{model} is ready.").format(model=name), "ok")
+                else:
+                    t.log(tr("{model} is unavailable.").format(model=name), "err")
+            if not names:
+                t.log(", ".join(ids) or tr("No model exposed: Open WebUI will not see anything."),
+                      "ok" if ids else "warn")
+            name = next((name for name in chat_names if name in ready), None)
+            if not name:
                 return
-            ids = [m.get("id") for m in r.json().get("data", [])]
-            t.log(f"1/2 ✓ {base}/models → {', '.join(ids) or tr('no models')}", "ok" if ids else "warn")
-            if not ids:
-                t.log(tr("No model exposed: Open WebUI will not see anything."), "err")
-                return
-            name = self.served_name if self.served_name in ids else ids[0]
 
             payload = {"model": name, "max_tokens": 512,
                        "messages": [{"role": "user", "content": tr("Hi! Answer with a single sentence.")}]}
-            t.log("2/2 " + tr("Sending a chat request to “{name}” (the first one can be slow)…").format(name=name))
+            t.log(tr("Sending a chat request to “{name}” (the first one can be slow)…").format(name=name))
             started = time.time()
             try:
                 r = requests.post(f"{base}/chat/completions", json=payload, timeout=300)
             except requests.RequestException as e:
-                t.log(f"2/2 ✗ /chat/completions: {e}", "err")
+                t.log(f"✗ /chat/completions: {e}", "err")
                 return
             if not r.ok:
-                t.log(f"2/2 ✗ /chat/completions → HTTP {r.status_code}: {r.text[:500]}", "err")
+                t.log(f"✗ /chat/completions → HTTP {r.status_code}: {r.text[:500]}", "err")
                 return
             try:
                 data = r.json()
@@ -2022,9 +2182,9 @@ class OVMSManager(QMainWindow):
                     answer = tr("(reasoning only, the answer has not started yet)") + " " + message["reasoning_content"]
                 usage = data.get("usage", {})
             except (ValueError, KeyError, IndexError):
-                t.log("2/2 ✗ " + tr("unexpected answer: {text}").format(text=r.text[:500]), "err")
+                t.log("✗ " + tr("unexpected answer: {text}").format(text=r.text[:500]), "err")
                 return
-            t.log("2/2 ✓ " + tr("answer in {seconds} s ({tokens} tokens): {answer}").format(
+            t.log("✓ " + tr("answer in {seconds} s ({tokens} tokens): {answer}").format(
                 seconds=f"{time.time() - started:.1f}", tokens=usage.get("completion_tokens", "?"),
                 answer=answer.strip()[:300]), "ok")
             t.log(tr("The API works. In Open WebUI use {url}, or {container_url} if Open WebUI runs in a container.")
@@ -2174,10 +2334,9 @@ class OVMSManager(QMainWindow):
             commands.append(C_(tr("Theme: {name}").format(name=tr(name)),
                                lambda c=code: self.cb_theme.setCurrentIndex(self.cb_theme.findData(c)),
                                tr("Theme"), icon="theme"))
-        for i in range(self.cb_models.count()):
-            rel = self.cb_models.itemText(i)
+        for rel in self.local_models:
             commands.append(C_(tr("Use in server: {model}").format(model=rel),
-                               lambda r=rel: (self.cb_models.setCurrentText(r), self.nav.setCurrentRow(0)),
+                               lambda r=rel: self._use_server_model(r),
                                tr("Local library"), icon="server"))
         if query:
             def search(q=query):
