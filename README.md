@@ -40,7 +40,7 @@
 <br>
 
 <p align="center">
-  <img src="docs/images/ovms-manager-explore-dark.png" alt="OVMS Manager: OpenVINO models on Hugging Face, with the RAM fit indicator" width="100%">
+  <img src="screenshots/ovms-manager-server-dark.png" alt="OVMS Manager: serve multiple local models on Intel CPU, GPU or NPU" width="100%">
 </p>
 
 > [!NOTE]
@@ -51,6 +51,7 @@
 
 <p align="center">
   <a href="#install">Install</a> ·
+  <a href="#screenshots">Screenshots</a> ·
   <a href="#the-four-pages">The four pages</a> ·
   <a href="#connect-open-webui">Open WebUI</a> ·
   <a href="#container-runtime">Container runtime</a> ·
@@ -110,6 +111,26 @@ in the Monad README for the packages of each distribution.
 
 The interface is in English or Italian and follows your system language. To change it, use the 🌐 menu at
 the bottom of the sidebar, then restart the app.
+
+## Screenshots
+
+### Explore Hugging Face
+
+Browse and filter the catalog of OpenVINO models ready to download.
+
+![OVMS Manager: Hugging Face model catalog with quantization filters](screenshots/ovms-manager-explore-dark.png)
+
+### Local library
+
+Manage downloaded models and select them for serving.
+
+![OVMS Manager: local model library with model sizes and quantization](screenshots/ovms-manager-library-dark.png)
+
+### Optimum converter
+
+Export and quantize Hugging Face models to OpenVINO IR.
+
+![OVMS Manager: Optimum converter with precision and destination options](screenshots/ovms-manager-converter-dark.png)
 
 ## The four pages
 
